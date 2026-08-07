@@ -16,7 +16,7 @@ permissions:
 
 env:
   # code.ffmpeg.org/FFmpeg/FFmpeg is canonical; this is its GitHub mirror and
-  # is much faster to clone from a GitHub runner.
+  # is far faster to clone from a GitHub runner.
   UPSTREAM: https://github.com/FFmpeg/FFmpeg.git
 
 concurrency:
@@ -42,7 +42,7 @@ jobs:
             echo "UPSTREAM_SHA=$(git -C src rev-parse HEAD)"
             echo "UPSTREAM_SHORT=$(git -C src rev-parse --short HEAD)"
           } >> "$GITHUB_ENV"
-          git -C src log -1 --format='upstream %h %s' | tee -a "$GITHUB_STEP_SUMMARY"
+          git -C src log -1 --format='upstream %h %s'
 
       - name: Restore ccache
         uses: actions/cache@v4
@@ -63,6 +63,7 @@ jobs:
       #    has fixed them and this repo has done its job.
       # ------------------------------------------------------------------
       - name: Build pristine upstream
+        id: build_pristine
         run: tests/build-linux.sh src
 
       - name: Verify pristine upstream
@@ -75,11 +76,12 @@ jobs:
           fi
 
       # ------------------------------------------------------------------
-      # 2. Apply the patches and rebuild.
+      # 2. Apply the patches and rebuild.  ccache makes this second build
+      #    cost little more than two recompiles and a relink.
       # ------------------------------------------------------------------
       - name: Apply patches
         id: apply
-        if: steps.pristine.outputs.ok != 'true'
+        if: steps.pristine.outputs.ok == 'false'
         run: |
           git -C src config user.name  'ffmpeg-patched CI'
           git -C src config user.email 'ci@invalid.local'
@@ -91,12 +93,13 @@ jobs:
           fi
 
       - name: Build patched
+        id: build_patched
         if: steps.apply.outputs.ok == 'true'
         run: tests/build-linux.sh src
 
       - name: Verify patched
         id: patched
-        if: steps.apply.outputs.ok == 'true'
+        if: steps.build_patched.outcome == 'success'
         run: |
           if tests/verify.sh src/ffmpeg "$RUNNER_TEMP/v-patched"; then
             echo 'ok=true' >> "$GITHUB_OUTPUT"
@@ -114,18 +117,20 @@ jobs:
           set -o pipefail
           S=$HOME/fate-suite
           mkdir -p "$S/exr"
-          rsync -rl --no-motd --timeout=60 \
-                rsync://fate-suite.ffmpeg.org/fate-suite/exr/ "$S/exr/" || \
-                echo "::warning::could not refresh fate samples, using cache"
+          rsync -rltLW --no-motd --timeout=60 \
+                rsync://fate-suite.ffmpeg.org/fate-suite/exr/ "$S/exr/" \
+            || echo "::warning::could not refresh fate samples, using cache"
           cp tests/assets/rgb_scanline_float_piz_dense_448x32.exr "$S/exr/"
           make -C src -j"$(nproc)" fate-ffv1 fate-exr SAMPLES="$S" 2>&1 | tee fate.log
 
-          # A skipped test prints nothing at all, so a green make proves
-          # nothing on its own.  Assert both new tests actually ran.
+          # Without SAMPLES, or with a missing component, a test is silently
+          # dropped rather than failed -- a green make would prove nothing.
+          # Assert both new tests actually ran.
           for t in ffv1-float-golomb exr-rgb-scanline-float-piz-dense; do
-            grep -q "TEST.*$t" fate.log || { echo "::error::fate test $t did not run"; exit 1; }
+            grep -qE "^TEST[[:space:]]+$t\$" fate.log \
+              || { echo "::error::fate test $t did not run"; exit 1; }
           done
-          echo "fate: $(grep -c '^TEST' fate.log) tests ran" >> "$GITHUB_STEP_SUMMARY"
+          echo "fate: $(grep -c '^TEST' fate.log) tests ran"
 
       # ------------------------------------------------------------------
       # 4. Verdict.
@@ -134,78 +139,102 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
+          BUILD_PRISTINE: ${{ steps.build_pristine.outcome }}
           PRISTINE: ${{ steps.pristine.outputs.ok }}
           APPLY: ${{ steps.apply.outputs.ok }}
+          BUILD_PATCHED: ${{ steps.build_patched.outcome }}
           PATCHED: ${{ steps.patched.outputs.ok }}
           FATE: ${{ steps.fate.outcome }}
         run: |
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
-          notify () {                       # notify <title> <body>
-            n=$(gh issue list --state open --search "in:title \"$1\"" \
-                  --json number,title --jq ".[] | select(.title == \"$1\") | .number" | head -1)
+          # notify <title> <line>...   -- comments on an existing open issue
+          # with the same title rather than opening a duplicate every day.
+          notify () {
+            title=$1; shift
+            printf '%s\n' "$@" "" "$RUN_URL" > "$RUNNER_TEMP/body.md"
+            n=$(gh issue list --state open --json number,title \
+                  --jq ".[] | select(.title == \"$title\") | .number" 2>/dev/null | head -1) || n=
             if [ -n "$n" ]; then
-              gh issue comment "$n" --body "$2"
+              gh issue comment "$n" --body-file "$RUNNER_TEMP/body.md"
             else
-              gh issue create --title "$1" --body "$2"
+              gh issue create --title "$title" --body-file "$RUNNER_TEMP/body.md"
             fi
           }
 
+          say () { printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; }
+          say "upstream \`$UPSTREAM_SHA\`" ""
+
+          # The build failing is a different thing from the patches being
+          # wrong, and upstream master does occasionally not build.
+          if [ "$BUILD_PRISTINE" != 'success' ]; then
+            say "### could not build pristine upstream" \
+                "Nothing was learned about the patches this run."
+            notify "pristine upstream does not build" \
+              "\`tests/build-linux.sh\` failed on unmodified upstream \`$UPSTREAM_SHA\`," \
+              "before any patch was applied. Either upstream master is broken or the" \
+              "build script needs updating. No conclusion about the patches this run."
+            exit 1
+          fi
+
           if [ "$PRISTINE" = 'true' ]; then
-            echo "### upstream appears fixed" >> "$GITHUB_STEP_SUMMARY"
-            echo "Pristine \`$UPSTREAM_SHORT\` passes every check with no patches applied." \
-                 >> "$GITHUB_STEP_SUMMARY"
+            say "### upstream appears fixed" \
+                "Pristine \`$UPSTREAM_SHORT\` passes every check with no patches applied."
             notify "upstream passes without our patches" \
-              "Pristine upstream \`$UPSTREAM_SHA\` passed \`tests/verify.sh\` with no patches applied.
-
-          Either the bugs were fixed upstream, or a check stopped being a real gate. Confirm which, then retire the corresponding patch.
-
-          $RUN_URL"
+              "Pristine upstream \`$UPSTREAM_SHA\` passed \`tests/verify.sh\` with no patches" \
+              "applied." "" \
+              "Either the bugs were fixed upstream, or a check stopped being a real gate." \
+              "Confirm which, then retire the corresponding patch."
             exit 0
           fi
 
           if [ "$APPLY" != 'true' ]; then
-            echo "### patches no longer apply" >> "$GITHUB_STEP_SUMMARY"
+            say "### patches no longer apply"
             notify "patches no longer apply to upstream master" \
-              "\`git am\` failed against upstream \`$UPSTREAM_SHA\`. Needs a human rebase.
+              "\`git am\` failed against upstream \`$UPSTREAM_SHA\`. Needs a human rebase."
+            exit 1
+          fi
 
-          $RUN_URL"
+          if [ "$BUILD_PATCHED" != 'success' ]; then
+            say "### patched tree does not build"
+            notify "patched tree does not build" \
+              "The patches applied to \`$UPSTREAM_SHA\` without conflict, but the resulting" \
+              "tree failed to compile. Upstream most likely changed something around the" \
+              "patched code that \`git am\` could not see."
             exit 1
           fi
 
           if [ "$PATCHED" != 'true' ]; then
-            echo "### RED ALERT: patches apply but the result is wrong" >> "$GITHUB_STEP_SUMMARY"
+            say "### RED ALERT: patches apply but the output is wrong"
             notify "patches apply cleanly but output is wrong" \
-              "The patches applied to upstream \`$UPSTREAM_SHA\` with no conflict, and the resulting binary FAILED \`tests/verify.sh\`.
-
-          This is the failure mode a conflict check cannot see: upstream most likely fixed one of these bugs from the other side of the codec, so our patch is now double-applying the correction. **Do not ship this build.**
-
-          $RUN_URL"
+              "The patches applied to upstream \`$UPSTREAM_SHA\` with no conflict, the tree" \
+              "built, and the resulting binary FAILED \`tests/verify.sh\`." "" \
+              "This is the failure mode a conflict check cannot see: upstream has most" \
+              "likely fixed one of these bugs from the other side of the codec, so our" \
+              "patch is now applying the correction a second time. **Do not ship this build.**"
             exit 1
           fi
 
           if [ "$FATE" != 'success' ]; then
-            echo "### FATE regression" >> "$GITHUB_STEP_SUMMARY"
+            say "### FATE regression"
             notify "FATE regression against upstream master" \
-              "\`tests/verify.sh\` passed but \`fate-ffv1\`/\`fate-exr\` did not, against upstream \`$UPSTREAM_SHA\`.
-
-          $RUN_URL"
+              "\`tests/verify.sh\` passed but \`fate-ffv1\`/\`fate-exr\` did not, against" \
+              "upstream \`$UPSTREAM_SHA\`."
             exit 1
           fi
 
-          echo "### good" >> "$GITHUB_STEP_SUMMARY"
-          echo "Patches apply and the build passes every check against \`$UPSTREAM_SHORT\`." \
-               >> "$GITHUB_STEP_SUMMARY"
+          say "### good" \
+              "Patches apply and the build passes every check against \`$UPSTREAM_SHORT\`."
 
       - name: Record last good upstream commit
-        if: success() && steps.pristine.outputs.ok != 'true'
+        if: success() && steps.pristine.outputs.ok == 'false'
         run: |
           mkdir -p state
           echo "$UPSTREAM_SHA" > state/last-good-upstream.txt
-          if ! git diff --quiet state/; then
+          git add state/
+          if ! git diff --cached --quiet; then
             git config user.name  'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add state/
             git commit -m "state: verified against upstream $UPSTREAM_SHORT"
             git push
           fi

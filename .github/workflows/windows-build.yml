@@ -109,7 +109,8 @@ jobs:
 
       - name: Verify
         shell: msys2 {0}
-        run: tests/verify.sh src/ffmpeg.exe "$RUNNER_TEMP/v-win"
+        # /tmp, not $RUNNER_TEMP: the latter is a backslashed Windows path.
+        run: tests/verify.sh src/ffmpeg.exe /tmp/v-win
 
       - name: Package
         shell: msys2 {0}
