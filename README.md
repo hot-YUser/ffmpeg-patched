@@ -1,5 +1,7 @@
 # ffmpeg-patched
 
+[![verify against upstream](https://github.com/hot-YUser/ffmpeg-patched/actions/workflows/verify.yml/badge.svg)](https://github.com/hot-YUser/ffmpeg-patched/actions/workflows/verify.yml)
+
 Two decoder fixes for FFmpeg that upstream has not merged yet, kept applying
 cleanly to the latest master and checked every day.
 
