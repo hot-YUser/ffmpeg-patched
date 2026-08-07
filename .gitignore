@@ -1,0 +1,4 @@
+src/
+*.zip
+ffmpeg-patched-*/
+fate.log

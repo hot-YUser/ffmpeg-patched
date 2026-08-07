@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.patch -text
+*.gbr binary
+*.mkv binary
+*.exr binary

@@ -1,0 +1,49 @@
+From 0a0f0a055b3fd56e50ea871acef9b88e10e3f28e Mon Sep 17 00:00:00 2001
+From: JUI YU LIN <hlpmrlinyu@gmail.com>
+Date: Thu, 6 Aug 2026 13:54:21 +0800
+Subject: [PATCH 4/4] tests/fate/image: cover the dense PIZ Huffman table
+
+The sample is 448x32 of float noise written by the OpenEXR reference library
+with PIZ compression, which is enough to need Huffman codes longer than 14 bits
+and so to exercise the path the previous VLC based decoder could not build.
+Before the previous commit the block decodes to all zeroes and the test fails.
+
+The sample has to be added to fate-suite as
+exr/rgb_scanline_float_piz_dense_448x32.exr; ffmpeg's own EXR encoder cannot
+write PIZ, so it cannot be generated at test time.
+
+Signed-off-by: JUI YU LIN <hlpmrlinyu@gmail.com>
+---
+ tests/fate/image.mak                            | 5 +++++
+ tests/ref/fate/exr-rgb-scanline-float-piz-dense | 6 ++++++
+ 2 files changed, 11 insertions(+)
+ create mode 100644 tests/ref/fate/exr-rgb-scanline-float-piz-dense
+
+diff --git a/tests/fate/image.mak b/tests/fate/image.mak
+index e9fe059..c062274 100644
+--- a/tests/fate/image.mak
++++ b/tests/fate/image.mak
+@@ -274,6 +274,11 @@ fate-exr-rgb-scanline-half-piz-dw-t01: CMD = framecrc -i $(TARGET_SAMPLES)/exr/r
+ FATE_EXR += fate-exr-rgb-scanline-float-piz-48x32
+ fate-exr-rgb-scanline-float-piz-48x32: CMD = framecrc -i $(TARGET_SAMPLES)/exr/rgb_scanline_float_piz_48x32.exr -vf scale -pix_fmt gbrpf32le
+ 
++# A dense Huffman table (many codes longer than 14 bits), which the previous
++# VLC-based decoder could not build.
++FATE_EXR += fate-exr-rgb-scanline-float-piz-dense
++fate-exr-rgb-scanline-float-piz-dense: CMD = framecrc -i $(TARGET_SAMPLES)/exr/rgb_scanline_float_piz_dense_448x32.exr -vf scale -pix_fmt gbrpf32le
++
+ FATE_EXR += fate-exr-rgb-scanline-none-negative-red
+ fate-exr-rgb-scanline-none-negative-red: CMD = framecrc -i $(TARGET_SAMPLES)/exr/rgb_scanline_none_negative_red.exr -vf scale -pix_fmt gbrpf32le
+ 
+diff --git a/tests/ref/fate/exr-rgb-scanline-float-piz-dense b/tests/ref/fate/exr-rgb-scanline-float-piz-dense
+new file mode 100644
+index 0000000..c63ddb9
+--- /dev/null
++++ b/tests/ref/fate/exr-rgb-scanline-float-piz-dense
+@@ -0,0 +1,6 @@
++#tb 0: 1/25
++#media_type 0: video
++#codec_id 0: rawvideo
++#dimensions 0: 448x32
++#sar 0: 1/1
++0,          0,          0,        1,   172032, 0x5c1d402d

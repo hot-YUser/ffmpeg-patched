@@ -1,0 +1,58 @@
+From 1317e9739257793a3e4a3cfe0aa82aac6d264deb Mon Sep 17 00:00:00 2001
+From: JUI YU LIN <hlpmrlinyu@gmail.com>
+Date: Thu, 6 Aug 2026 08:12:53 +0800
+Subject: [PATCH 2/4] tests/fate/ffv1: cover the float Golomb-Rice path
+
+The reproducer is a 16x16 checkerboard of two values, which leaves each slice
+plane with a two entry remap table and therefore a one bit wide coded symbol.
+Before the previous commit this decoded to different pixel values; the test
+fails without it and passes with it.
+
+Signed-off-by: JUI YU LIN <hlpmrlinyu@gmail.com>
+---
+ tests/Makefile                   | 1 +
+ tests/fate/ffv1.mak              | 7 +++++++
+ tests/ref/fate/ffv1-float-golomb | 8 ++++++++
+ 3 files changed, 16 insertions(+)
+ create mode 100644 tests/fate/ffv1.mak
+ create mode 100644 tests/ref/fate/ffv1-float-golomb
+
+diff --git a/tests/Makefile b/tests/Makefile
+index 3f0132d..4a54d3c 100644
+--- a/tests/Makefile
++++ b/tests/Makefile
+@@ -188,6 +188,7 @@ include $(SRC_PATH)/tests/fate/enc_external.mak
+ # Must be included after lavf-video.mak
+ include $(SRC_PATH)/tests/fate/ffmpeg.mak
+ include $(SRC_PATH)/tests/fate/ffprobe.mak
++include $(SRC_PATH)/tests/fate/ffv1.mak
+ include $(SRC_PATH)/tests/fate/fifo-muxer.mak
+ include $(SRC_PATH)/tests/fate/filter-audio.mak
+ # Must be included after vcodec.mak
+diff --git a/tests/fate/ffv1.mak b/tests/fate/ffv1.mak
+new file mode 100644
+index 0000000..01c2e3a
+--- /dev/null
++++ b/tests/fate/ffv1.mak
+@@ -0,0 +1,7 @@
++# A slice plane holding only two distinct values gets a two entry remap table,
++# hence a one bit wide coded symbol, which is where Golomb-Rice used to desync.
++FATE_FFV1_FFMPEG-$(call TRANSCODE, FFV1, MATROSKA, RAWVIDEO_DECODER COLOR_FILTER FORMAT_FILTER GEQ_FILTER LAVFI_INDEV) += fate-ffv1-float-golomb
++fate-ffv1-float-golomb: CMD = transcode "lavfi -graph color=c=black:s=16x16:d=1:r=1,format=gray,geq=lum=if(mod(X+Y\,2)\,200\,100),format=gbrpf32le" "foo" matroska "-c:v ffv1 -level 4 -strict experimental -slices 1" "-c:v rawvideo -pix_fmt gbrpf32le"
++
++FATE_FFMPEG += $(FATE_FFV1_FFMPEG-yes)
++fate-ffv1: $(FATE_FFV1_FFMPEG-yes)
+diff --git a/tests/ref/fate/ffv1-float-golomb b/tests/ref/fate/ffv1-float-golomb
+new file mode 100644
+index 0000000..6580191
+--- /dev/null
++++ b/tests/ref/fate/ffv1-float-golomb
+@@ -0,0 +1,8 @@
++24c06e77d129df34fbec70312562ef99 *tests/data/fate/ffv1-float-golomb.matroska
++759 tests/data/fate/ffv1-float-golomb.matroska
++#tb 0: 1/1
++#media_type 0: video
++#codec_id 0: rawvideo
++#dimensions 0: 16x16
++#sar 0: 1/1
++0,          0,          0,        1,     3072, 0x9916abbc

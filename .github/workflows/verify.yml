@@ -1,0 +1,211 @@
+name: verify against upstream
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+  push:
+    paths:
+      - 'patches/**'
+      - 'tests/**'
+      - '.github/workflows/verify.yml'
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  # code.ffmpeg.org/FFmpeg/FFmpeg is canonical; this is its GitHub mirror and
+  # is much faster to clone from a GitHub runner.
+  UPSTREAM: https://github.com/FFmpeg/FFmpeg.git
+
+concurrency:
+  group: verify
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ccache nasm rsync
+
+      - name: Clone upstream master
+        run: |
+          git clone --depth 1 "$UPSTREAM" src
+          {
+            echo "UPSTREAM_SHA=$(git -C src rev-parse HEAD)"
+            echo "UPSTREAM_SHORT=$(git -C src rev-parse --short HEAD)"
+          } >> "$GITHUB_ENV"
+          git -C src log -1 --format='upstream %h %s' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ env.UPSTREAM_SHA }}
+          restore-keys: ccache-${{ runner.os }}-
+
+      - name: Cache fate samples
+        uses: actions/cache@v4
+        with:
+          path: ~/fate-suite
+          key: fate-suite-exr-v1
+
+      # ------------------------------------------------------------------
+      # 1. Pristine upstream.  Expected to FAIL verification -- that failure
+      #    is what says the bugs are still there.  If it ever passes, upstream
+      #    has fixed them and this repo has done its job.
+      # ------------------------------------------------------------------
+      - name: Build pristine upstream
+        run: tests/build-linux.sh src
+
+      - name: Verify pristine upstream
+        id: pristine
+        run: |
+          if tests/verify.sh src/ffmpeg "$RUNNER_TEMP/v-pristine"; then
+            echo 'ok=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'ok=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      # ------------------------------------------------------------------
+      # 2. Apply the patches and rebuild.
+      # ------------------------------------------------------------------
+      - name: Apply patches
+        id: apply
+        if: steps.pristine.outputs.ok != 'true'
+        run: |
+          git -C src config user.name  'ffmpeg-patched CI'
+          git -C src config user.email 'ci@invalid.local'
+          if git -C src am "$GITHUB_WORKSPACE"/patches/*.patch; then
+            echo 'ok=true' >> "$GITHUB_OUTPUT"
+          else
+            git -C src am --abort || true
+            echo 'ok=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build patched
+        if: steps.apply.outputs.ok == 'true'
+        run: tests/build-linux.sh src
+
+      - name: Verify patched
+        id: patched
+        if: steps.apply.outputs.ok == 'true'
+        run: |
+          if tests/verify.sh src/ffmpeg "$RUNNER_TEMP/v-patched"; then
+            echo 'ok=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'ok=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      # ------------------------------------------------------------------
+      # 3. FATE, as a regression net around the two touched decoders.
+      # ------------------------------------------------------------------
+      - name: FATE (fate-ffv1, fate-exr)
+        id: fate
+        if: steps.patched.outputs.ok == 'true'
+        run: |
+          set -o pipefail
+          S=$HOME/fate-suite
+          mkdir -p "$S/exr"
+          rsync -rl --no-motd --timeout=60 \
+                rsync://fate-suite.ffmpeg.org/fate-suite/exr/ "$S/exr/" || \
+                echo "::warning::could not refresh fate samples, using cache"
+          cp tests/assets/rgb_scanline_float_piz_dense_448x32.exr "$S/exr/"
+          make -C src -j"$(nproc)" fate-ffv1 fate-exr SAMPLES="$S" 2>&1 | tee fate.log
+
+          # A skipped test prints nothing at all, so a green make proves
+          # nothing on its own.  Assert both new tests actually ran.
+          for t in ffv1-float-golomb exr-rgb-scanline-float-piz-dense; do
+            grep -q "TEST.*$t" fate.log || { echo "::error::fate test $t did not run"; exit 1; }
+          done
+          echo "fate: $(grep -c '^TEST' fate.log) tests ran" >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 4. Verdict.
+      # ------------------------------------------------------------------
+      - name: Verdict
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRISTINE: ${{ steps.pristine.outputs.ok }}
+          APPLY: ${{ steps.apply.outputs.ok }}
+          PATCHED: ${{ steps.patched.outputs.ok }}
+          FATE: ${{ steps.fate.outcome }}
+        run: |
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          notify () {                       # notify <title> <body>
+            n=$(gh issue list --state open --search "in:title \"$1\"" \
+                  --json number,title --jq ".[] | select(.title == \"$1\") | .number" | head -1)
+            if [ -n "$n" ]; then
+              gh issue comment "$n" --body "$2"
+            else
+              gh issue create --title "$1" --body "$2"
+            fi
+          }
+
+          if [ "$PRISTINE" = 'true' ]; then
+            echo "### upstream appears fixed" >> "$GITHUB_STEP_SUMMARY"
+            echo "Pristine \`$UPSTREAM_SHORT\` passes every check with no patches applied." \
+                 >> "$GITHUB_STEP_SUMMARY"
+            notify "upstream passes without our patches" \
+              "Pristine upstream \`$UPSTREAM_SHA\` passed \`tests/verify.sh\` with no patches applied.
+
+          Either the bugs were fixed upstream, or a check stopped being a real gate. Confirm which, then retire the corresponding patch.
+
+          $RUN_URL"
+            exit 0
+          fi
+
+          if [ "$APPLY" != 'true' ]; then
+            echo "### patches no longer apply" >> "$GITHUB_STEP_SUMMARY"
+            notify "patches no longer apply to upstream master" \
+              "\`git am\` failed against upstream \`$UPSTREAM_SHA\`. Needs a human rebase.
+
+          $RUN_URL"
+            exit 1
+          fi
+
+          if [ "$PATCHED" != 'true' ]; then
+            echo "### RED ALERT: patches apply but the result is wrong" >> "$GITHUB_STEP_SUMMARY"
+            notify "patches apply cleanly but output is wrong" \
+              "The patches applied to upstream \`$UPSTREAM_SHA\` with no conflict, and the resulting binary FAILED \`tests/verify.sh\`.
+
+          This is the failure mode a conflict check cannot see: upstream most likely fixed one of these bugs from the other side of the codec, so our patch is now double-applying the correction. **Do not ship this build.**
+
+          $RUN_URL"
+            exit 1
+          fi
+
+          if [ "$FATE" != 'success' ]; then
+            echo "### FATE regression" >> "$GITHUB_STEP_SUMMARY"
+            notify "FATE regression against upstream master" \
+              "\`tests/verify.sh\` passed but \`fate-ffv1\`/\`fate-exr\` did not, against upstream \`$UPSTREAM_SHA\`.
+
+          $RUN_URL"
+            exit 1
+          fi
+
+          echo "### good" >> "$GITHUB_STEP_SUMMARY"
+          echo "Patches apply and the build passes every check against \`$UPSTREAM_SHORT\`." \
+               >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record last good upstream commit
+        if: success() && steps.pristine.outputs.ok != 'true'
+        run: |
+          mkdir -p state
+          echo "$UPSTREAM_SHA" > state/last-good-upstream.txt
+          if ! git diff --quiet state/; then
+            git config user.name  'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add state/
+            git commit -m "state: verified against upstream $UPSTREAM_SHORT"
+            git push
+          fi

@@ -1,0 +1,63 @@
+From 088eb6bfd9e76d3b9fd838f672535a9a3d2c4ce4 Mon Sep 17 00:00:00 2001
+From: JUI YU LIN <hlpmrlinyu@gmail.com>
+Date: Thu, 6 Aug 2026 08:12:53 +0800
+Subject: [PATCH 1/4] avcodec/ffv1dec: do not clamp the Golomb-Rice k to bits
+
+put_vlc_symbol() in ffv1enc.c derives the Rice parameter k as
+
+    i = state->count;
+    k = 0;
+    while (i < state->error_sum) { k++; i += i; }
+
+and writes the symbol with that k. get_vlc_symbol() derives k with the same
+loop but then clamps it to bits, so whenever k > bits the two sides use
+different Rice parameters, the read consumes the wrong number of bits and the
+remainder of the slice desyncs. Neither RFC 9043 nor the FFV1 v4 draft has
+that clamp; both specify the bare loop.
+
+The clamp used to be unreachable. For integer formats bits is 8..16, and since
+fold() bounds the coded residual to [-(1 << (bits-1)), (1 << (bits-1)) - 1],
+error_sum/count stays under 1 << bits, so k stays <= bits. FFV1 v4 remapping
+breaks that: ff_ffv1_compute_bits_per_plane() takes the symbol width from the
+remap table size, bits[p] = av_ceil_log2(remap_count[p]), which is 1 for any
+slice plane holding only two distinct values. The initial VlcState
+(error_sum = 4, count = 1) already walks the loop to k == 2, so such a plane
+desyncs on its very first coded symbol.
+
+The effect is a silently non-lossless round trip for every float pixel format
+at default settings, since coder defaults to rice and float forces
+remap_mode 2. gbrpf32le, gbrpf16le, grayf16le and yaf16le are all affected;
+integer formats are not.
+
+Keep a bound so damaged input cannot produce a negative shift inside
+get_ur_golomb(), but use the encoder's own invariant (av_assert2(k <= 16) in
+put_vlc_symbol) rather than bits.
+
+Existing streams are not lost. With bits == 1 the unsigned Golomb value is 0
+or 1, so e = i >> k is 0, far below limit == 12, and the escape branch - the
+only one the decoder reads back at only esc_len == bits bits wide - is never
+taken. Streams written by unpatched encoders therefore decode byte exactly
+again with this change.
+
+Signed-off-by: JUI YU LIN <hlpmrlinyu@gmail.com>
+---
+ libavcodec/ffv1dec.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/libavcodec/ffv1dec.c b/libavcodec/ffv1dec.c
+index 8de15d2..f2c0f9f 100644
+--- a/libavcodec/ffv1dec.c
++++ b/libavcodec/ffv1dec.c
+@@ -56,10 +56,10 @@ static inline int get_vlc_symbol(GetBitContext *gb, VlcState *const state,
+         k++;
+         i += i;
+     }
+-    if (k > bits) {
++    if (k > 16) {
+         ff_dlog(NULL, "k-overflow bias:%d error:%d drift:%d count:%d k:%d",
+                 state->bias, state->error_sum, state->drift, state->count, k);
+-        k = bits;
++        k = 16;
+     }
+ 
+     v = get_sr_golomb(gb, k, 12, bits);

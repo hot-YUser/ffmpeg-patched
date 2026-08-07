@@ -1,0 +1,434 @@
+From 6da09194095f45b7efece70357a234ba014e52a6 Mon Sep 17 00:00:00 2001
+From: JUI YU LIN <hlpmrlinyu@gmail.com>
+Date: Thu, 6 Aug 2026 13:54:21 +0800
+Subject: [PATCH 3/4] avcodec/exr: port the PIZ Huffman decoder from OpenEXR
+
+huf_build_dec_table() built a VLC table with ff_vlc_init_sparse(..., nb_bits=12)
+and huf_decode() read it back with get_vlc2(). VLC subtable indices are stored
+in VLCBaseType, which is int16_t (libavcodec/vlc.h), so as soon as a table needs
+a subtable index above 32767, build_table() takes its "strange codes" path and
+returns AVERROR_PATCHWELCOME (libavcodec/vlc.c). huf_uncompress() then failed
+and the entire 32 line scanline block was left zero filled, which shows up as
+horizontal black bands. Only a log line was emitted; decoding otherwise
+"succeeded".
+
+Dense tables are easy to reach with 32 bit float content, where a block can
+carry tens of thousands of codes longer than 14 bits. On a 1920x1080 PIZ
+sequence, 25 of 30 sampled frames failed this way, in the worst case all 34
+blocks of a frame.
+
+Replace the VLC table with the reference decoder from OpenEXR's ImfHuf.cpp: a
+14 bit primary table plus, for codes longer than 14 bits, a per entry list of
+candidate symbols matched against the canonical code. That has no 16 bit index
+limit, so dense tables decode. The run length symbol is the pseudo-symbol at
+index iM, which is what the encoder emits, rather than a zero frequency symbol
+chosen heuristically.
+
+Unlike the reference, the refill inside the run length expansion checks that
+the input pointer is still inside the buffer before reading a byte.
+
+The affected frames now decode byte exactly against the OpenEXR reference
+library, and the existing fate exr tests are unchanged.
+
+This looks like the same defect as ticket #11486, whose log shows the same
+"strange codes" message for a half float PIZ file; that reporter's sample was
+not available here, so it is not claimed as fixed.
+
+Signed-off-by: JUI YU LIN <hlpmrlinyu@gmail.com>
+---
+ libavcodec/exr.c | 292 ++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 214 insertions(+), 78 deletions(-)
+
+diff --git a/libavcodec/exr.c b/libavcodec/exr.c
+index 0e9c734..a86930e 100644
+--- a/libavcodec/exr.c
++++ b/libavcodec/exr.c
+@@ -22,6 +22,40 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++/*
++ * huf_build_dec_table() and huf_decode() below are derived from
++ * hufBuildDecTable() and hufDecode() in src/lib/OpenEXR/ImfHuf.cpp of the
++ * OpenEXR reference implementation, distributed under the following terms:
++ *
++ * Copyright (c) Contributors to the OpenEXR Project. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice,
++ *    this list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ *    this list of conditions and the following disclaimer in the documentation
++ *    and/or other materials provided with the distribution.
++ *
++ * 3. Neither the name of the copyright holder nor the names of its
++ *    contributors may be used to endorse or promote products derived from this
++ *    software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
+ /**
+  * @file
+  * OpenEXR decoder
+@@ -92,11 +126,11 @@ enum ExrTileLevelRound {
+     EXR_TILE_ROUND_UNKNOWN,
+ };
+ 
+-typedef struct HuffEntry {
+-    uint8_t  len;
+-    uint16_t sym;
+-    uint32_t code;
+-} HuffEntry;
++typedef struct HufDec {
++    int  len;          /* short code: code length; long code: 0 */
++    int  lit;          /* short code: literal; long code: number of candidates */
++    int *p;            /* long code: candidate symbol indices (short code: NULL) */
++} HufDec;
+ 
+ typedef struct EXRChannel {
+     int xsub, ysub;
+@@ -138,10 +172,8 @@ typedef struct EXRThreadData {
+ 
+     int channel_line_size;
+ 
+-    int run_sym;
+-    HuffEntry *he;
+     uint64_t *freq;
+-    VLC vlc;
++    HufDec *hdec;              /* Huffman decode table (PIZ), HUF_DECSIZE entries */
+ } EXRThreadData;
+ 
+ typedef struct EXRContext {
+@@ -299,6 +331,9 @@ static void apply_lut(const uint16_t *lut, uint16_t *dst, int dsize)
+ 
+ #define HUF_ENCBITS 16  // literal (value) bit length
+ #define HUF_ENCSIZE ((1 << HUF_ENCBITS) + 1)  // encoding table size
++#define HUF_DECBITS 14  // decoding table size exponent (>= 8), as in OpenEXR
++#define HUF_DECSIZE (1 << HUF_DECBITS)
++#define HUF_DECMASK (HUF_DECSIZE - 1)
+ 
+ static void huf_canonical_code_table(uint64_t *freq)
+ {
+@@ -371,83 +406,183 @@ static int huf_unpack_enc_table(GetByteContext *gb,
+     return 0;
+ }
+ 
+-static int huf_build_dec_table(const EXRContext *s,
+-                               EXRThreadData *td, int im, int iM)
++static int huf_build_dec_table(EXRThreadData *td, int im, int iM)
+ {
+-    int j = 0;
+-
+-    td->run_sym = -1;
+-    for (int i = im; i < iM; i++) {
+-        td->he[j].sym = i;
+-        td->he[j].len = td->freq[i] & 63;
+-        td->he[j].code = td->freq[i] >> 6;
+-        if (td->he[j].len > 32) {
+-            avpriv_request_sample(s->avctx, "Too big code length");
+-            return AVERROR_PATCHWELCOME;
+-        }
+-        if (td->he[j].len > 0)
+-            j++;
+-        else
+-            td->run_sym = i;
+-    }
++    HufDec *hdec;
++    int i, ret = 0;
+ 
+-    if (im > 0)
+-        td->run_sym = 0;
+-    else if (iM < 65535)
+-        td->run_sym = 65535;
++    if (!td->hdec) {
++        td->hdec = av_calloc(HUF_DECSIZE, sizeof(*td->hdec));
++        if (!td->hdec)
++            return AVERROR(ENOMEM);
++    }
++    hdec = td->hdec;
+ 
+-    if (td->run_sym == -1) {
+-        avpriv_request_sample(s->avctx, "No place for run symbol");
+-        return AVERROR_PATCHWELCOME;
++    for (i = 0; i < HUF_DECSIZE; i++) {
++        av_freep(&hdec[i].p);
++        hdec[i].len = 0;
++        hdec[i].lit = 0;
+     }
+ 
+-    td->he[j].sym = td->run_sym;
+-    td->he[j].len = td->freq[iM] & 63;
+-    if (td->he[j].len > 32) {
+-        avpriv_request_sample(s->avctx, "Too big code length");
+-        return AVERROR_PATCHWELCOME;
++    for (i = im; i <= iM; i++) {
++        uint64_t c   = td->freq[i] >> 6;
++        int      len = td->freq[i] & 63;
++
++        if (c >> len) {
++            /* code wider than its length */
++            ret = AVERROR_INVALIDDATA;
++            goto fail;
++        }
++
++        if (len > HUF_DECBITS) {
++            /* long code: add a candidate to the secondary entry */
++            HufDec *pl = &hdec[c >> (len - HUF_DECBITS)];
++            int *p;
++
++            if (pl->len) {
++                ret = AVERROR_INVALIDDATA;
++                goto fail;
++            }
++
++            p = av_realloc_array(pl->p, pl->lit + 1, sizeof(*pl->p));
++            if (!p) {
++                ret = AVERROR(ENOMEM);
++                goto fail;
++            }
++            pl->p = p;
++            pl->p[pl->lit++] = i;
++        } else if (len) {
++            /* short code: fill the primary entries it covers */
++            HufDec *pl = &hdec[c << (HUF_DECBITS - len)];
++
++            for (uint64_t n = 1 << (HUF_DECBITS - len); n > 0; n--, pl++) {
++                if (pl->len || pl->p) {
++                    ret = AVERROR_INVALIDDATA;
++                    goto fail;
++                }
++                pl->len = len;
++                pl->lit = i;
++            }
++        }
+     }
+-    td->he[j].code = td->freq[iM] >> 6;
+-    j++;
+-
+-    ff_vlc_free(&td->vlc);
+-    return ff_vlc_init_sparse(&td->vlc, 12, j,
+-                              &td->he[0].len, sizeof(td->he[0]), sizeof(td->he[0].len),
+-                              &td->he[0].code, sizeof(td->he[0]), sizeof(td->he[0].code),
+-                              &td->he[0].sym, sizeof(td->he[0]), sizeof(td->he[0].sym), 0);
++
++    return 0;
++fail:
++    for (i = 0; i < HUF_DECSIZE; i++)
++        av_freep(&hdec[i].p);
++    return ret;
+ }
+ 
+-static int huf_decode(VLC *vlc, GetByteContext *gb, int nbits, int run_sym,
+-                      int no, uint16_t *out)
++static int huf_decode(EXRThreadData *td, const uint8_t *in, int nbits,
++                      int run_sym, int no, uint16_t *out)
+ {
+-    GetBitContext gbit;
+-    int oe = 0;
++    const HufDec *hdec = td->hdec;
++    const uint8_t *ie  = in + (nbits + 7) / 8;
++    uint16_t *ob = out, *oe = out + no;
++    uint64_t c  = 0;
++    int      lc = 0;
++    int      ret = 0;
++
++    /* Emit one decoded symbol, expanding a run-length code, as hufDecode() does.
++     * Jumps to huf_end on malformed input. */
++#define GET_CODE(po)                                                        \
++    do {                                                                    \
++        if ((po) == run_sym) {                                              \
++            int cs;                                                         \
++                                                                            \
++            if (lc < 8) {                                                   \
++                if (in >= ie) {                                             \
++                    ret = AVERROR_INVALIDDATA;                              \
++                    goto huf_end;                                           \
++                }                                                           \
++                c   = (c << 8) | *in++;                                     \
++                lc += 8;                                                    \
++            }                                                               \
++            lc -= 8;                                                        \
++            cs  = (c >> lc) & 0xff;                                         \
++            if (out + cs > oe || out - 1 < ob) {                            \
++                ret = AVERROR_INVALIDDATA;                                  \
++                goto huf_end;                                               \
++            }                                                               \
++            {                                                               \
++                uint16_t fill = out[-1];                                    \
++                                                                            \
++                while (cs-- > 0)                                            \
++                    *out++ = fill;                                          \
++            }                                                               \
++        } else {                                                            \
++            if (out >= oe) {                                                \
++                ret = AVERROR_INVALIDDATA;                                  \
++                goto huf_end;                                               \
++            }                                                               \
++            *out++ = (po);                                                  \
++        }                                                                   \
++    } while (0)
++
++    while (in < ie) {
++        c  = (c << 8) | *in++;
++        lc += 8;
++
++        while (lc >= HUF_DECBITS) {
++            const HufDec *pl = &hdec[(c >> (lc - HUF_DECBITS)) & HUF_DECMASK];
++
++            if (pl->len) {
++                lc -= pl->len;
++                if (lc < 0) { ret = AVERROR_INVALIDDATA; goto huf_end; }
++                GET_CODE(pl->lit);
++            } else {
++                int j;
+ 
+-    init_get_bits(&gbit, gb->buffer, nbits);
+-    while (get_bits_left(&gbit) > 0 && oe < no) {
+-        uint16_t x = get_vlc2(&gbit, vlc->table, 12, 3);
++                if (!pl->p) { ret = AVERROR_INVALIDDATA; goto huf_end; }
+ 
+-        if (x == run_sym) {
+-            int run = get_bits(&gbit, 8);
+-            uint16_t fill;
++                for (j = 0; j < pl->lit; j++) {
++                    int l = td->freq[pl->p[j]] & 63;
+ 
+-            if (oe == 0 || oe + run > no)
+-                return AVERROR_INVALIDDATA;
++                    while (lc < l && in < ie) {
++                        c  = (c << 8) | *in++;
++                        lc += 8;
++                    }
++                    if (lc >= l &&
++                        (td->freq[pl->p[j]] >> 6) ==
++                            ((c >> (lc - l)) & ((1ULL << l) - 1))) {
++                        lc -= l;
++                        GET_CODE(pl->p[j]);
++                        break;
++                    }
++                }
++                if (j == pl->lit) { ret = AVERROR_INVALIDDATA; goto huf_end; }
++            }
++        }
++    }
+ 
+-            fill = out[oe - 1];
++    /* trailing short codes, aligned to the declared bit count */
++    {
++        int i = (8 - nbits) & 7;
+ 
+-            while (run-- > 0)
+-                out[oe++] = fill;
+-        } else {
+-            out[oe++] = x;
++        c  >>= i;
++        lc -= i;
++        while (lc > 0) {
++            const HufDec *pl = &hdec[(c << (HUF_DECBITS - lc)) & HUF_DECMASK];
++
++            if (pl->len) {
++                lc -= pl->len;
++                if (lc < 0) { ret = AVERROR_INVALIDDATA; goto huf_end; }
++                GET_CODE(pl->lit);
++            } else {
++                ret = AVERROR_INVALIDDATA;
++                goto huf_end;
++            }
+         }
+     }
+ 
+-    return 0;
++huf_end:
++    if (!ret && out - ob != no)
++        ret = AVERROR_INVALIDDATA;
++#undef GET_CODE
++    return ret;
+ }
+ 
+-static int huf_uncompress(const EXRContext *s,
+-                          EXRThreadData *td,
++static int huf_uncompress(EXRThreadData *td,
+                           GetByteContext *gb,
+                           uint16_t *dst, int dst_size)
+ {
+@@ -465,13 +600,10 @@ static int huf_uncompress(const EXRContext *s,
+ 
+     bytestream2_skip(gb, 4);
+ 
+-    if (!td->freq)
++    if (!td->freq) {
+         td->freq = av_malloc_array(HUF_ENCSIZE, sizeof(*td->freq));
+-    if (!td->he)
+-        td->he = av_calloc(HUF_ENCSIZE, sizeof(*td->he));
+-    if (!td->freq || !td->he) {
+-        ret = AVERROR(ENOMEM);
+-        return ret;
++        if (!td->freq)
++            return AVERROR(ENOMEM);
+     }
+ 
+     memset(td->freq, 0, sizeof(*td->freq) * HUF_ENCSIZE);
+@@ -483,9 +615,10 @@ static int huf_uncompress(const EXRContext *s,
+         return ret;
+     }
+ 
+-    if ((ret = huf_build_dec_table(s, td, im, iM)) < 0)
++    /* run-length code is the pseudo-symbol at index iM, as in OpenEXR */
++    if ((ret = huf_build_dec_table(td, im, iM)) < 0)
+         return ret;
+-    return huf_decode(&td->vlc, gb, nBits, td->run_sym, dst_size, dst);
++    return huf_decode(td, gb->buffer, nBits, iM, dst_size, dst);
+ }
+ 
+ static inline void wdec14(uint16_t l, uint16_t h, uint16_t *a, uint16_t *b)
+@@ -637,7 +770,7 @@ static int piz_uncompress(const EXRContext *s, const uint8_t *src, int ssize,
+     maxval = reverse_lut(td->bitmap, td->lut);
+ 
+     bytestream2_skip(&gb, 4);
+-    ret = huf_uncompress(s, td, &gb, tmp, dsize / sizeof(uint16_t));
++    ret = huf_uncompress(td, &gb, tmp, dsize / sizeof(uint16_t));
+     if (ret)
+         return ret;
+ 
+@@ -1068,7 +1201,7 @@ static int dwa_uncompress(const EXRContext *s, const uint8_t *src, int compresse
+ 
+         switch (ac_compression) {
+         case 0:
+-            ret = huf_uncompress(s, td, &agb, (int16_t *)td->ac_data, ac_count);
++            ret = huf_uncompress(td, &agb, (int16_t *)td->ac_data, ac_count);
+             if (ret < 0)
+                 return ret;
+             break;
+@@ -2331,13 +2464,16 @@ static av_cold int decode_end(AVCodecContext *avctx)
+         av_freep(&td->tmp);
+         av_freep(&td->bitmap);
+         av_freep(&td->lut);
+-        av_freep(&td->he);
+         av_freep(&td->freq);
+         av_freep(&td->ac_data);
+         av_freep(&td->dc_data);
+         av_freep(&td->rle_data);
+         av_freep(&td->rle_raw_data);
+-        ff_vlc_free(&td->vlc);
++        if (td->hdec) {
++            for (int j = 0; j < HUF_DECSIZE; j++)
++                av_freep(&td->hdec[j].p);
++            av_freep(&td->hdec);
++        }
+     }
+ 
+     av_freep(&s->thread_data);
