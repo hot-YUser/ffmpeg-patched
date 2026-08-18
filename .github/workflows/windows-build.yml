@@ -30,7 +30,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: msys2/setup-msys2@v2
         with:
@@ -192,7 +192,7 @@ jobs:
           upstream commit : $UPSTREAM_SHA
           upstream source : https://code.ffmpeg.org/FFmpeg/FFmpeg
           patches applied : see the patches/ directory next to this file
-          dropped libs    : ${DROPPED_LIBS:-none} (unresolved by pkg-config at build time)
+          dropped libs    : ${DROPPED_LIBS:-none} (rejected by configure's link test)
           workflow run    : $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
 
           To reproduce, clone upstream at the commit above, "git am patches/*.patch",
@@ -206,7 +206,7 @@ jobs:
           ls -la "$D.zip"
           echo "PKG=$D" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ env.PKG }}
           path: ${{ env.PKG }}.zip

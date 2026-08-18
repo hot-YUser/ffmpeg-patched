@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install build dependencies
         run: |
@@ -45,14 +45,14 @@ jobs:
           git -C src log -1 --format='upstream %h %s'
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/ccache
           key: ccache-${{ runner.os }}-${{ env.UPSTREAM_SHA }}
           restore-keys: ccache-${{ runner.os }}-
 
       - name: Cache fate samples
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/fate-suite
           key: fate-suite-exr-v1
