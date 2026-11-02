@@ -77,9 +77,7 @@ corresponding patch should be deleted. Nothing here is meant to be permanent.
 ## License and provenance
 
 The patches are derivative works of FFmpeg and carry its license: LGPL v2.1+,
-or GPL for the parts that require it. `patches/0003` ports code from the
-OpenEXR reference library, which is BSD-3-Clause; that notice is reproduced in
-the patched source and must be kept.
+or GPL for the parts that require it.
 
 Published binaries are configured with `--enable-gpl --enable-version3`, so
 they are GPL v3. The complete corresponding source is the upstream commit

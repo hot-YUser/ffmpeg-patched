@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: JUI YU LIN <hlpmrlinyu@gmail.com>
+Date: Tue, 3 Nov 2026 10:00:00 +0800
+Subject: [PATCH 3/4] avcodec/exr: decode long PIZ Huffman codes outside the VLC
+
+VLC subtable indices are stored in VLCBaseType, which is int16_t, so a dense
+Huffman table needing a subtable index above 32767 makes build_table() fail
+with "strange codes". huf_uncompress() then fails and the whole scanline block
+stays zero filled, while decoding otherwise reports success.
+
+Keep only the codes of up to 14 bits in the VLC. With its 12 bit primary table
+those need at most 4096 subtables of 4 entries, so the index cannot overflow and
+tables without long codes build and decode as before. The codes are canonical,
+hence consecutive within a length in symbol order, so a longer code is found
+from the first code and the position of its length. The cost is bounded by the
+code length, however many codes share a prefix.
+
+At most 2^14 codes can be that short, so the VLC always has a free symbol for
+the run code, even when every 16 bit literal is in use.
+
+Fixes: #24027
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ libavcodec/exr.c | 83 +++++++++++++++++++++++++++-----
+ 1 file changed, 71 insertions(+), 12 deletions(-)
+
+diff --git a/libavcodec/exr.c b/libavcodec/exr.c
+index 0e9c734..318df0d 100644
+--- a/libavcodec/exr.c
++++ b/libavcodec/exr.c
+@@ -142,6 +142,9 @@ typedef struct EXRThreadData {
+     HuffEntry *he;
+     uint64_t *freq;
+     VLC vlc;
++    int *long_sym;             // symbols of the codes longer than HUF_VLC_MAXLEN
++    uint32_t long_limit;       // HUF_VLC_MAXLEN bit prefixes below this start a long code
++    uint32_t long_first[33], long_count[33], long_start[33];  // per code length
+ } EXRThreadData;
+ 
+ typedef struct EXRContext {
+@@ -299,10 +302,14 @@ static void apply_lut(const uint16_t *lut, uint16_t *dst, int dsize)
+ 
+ #define HUF_ENCBITS 16  // literal (value) bit length
+ #define HUF_ENCSIZE ((1 << HUF_ENCBITS) + 1)  // encoding table size
++#define HUF_VLC_MAXLEN 14  // longer codes could overflow the int16_t VLC subtable index
++#define HUF_RUN (1 << HUF_ENCBITS)  // run length pseudo-symbol
+ 
+-static void huf_canonical_code_table(uint64_t *freq)
++static void huf_canonical_code_table(EXRThreadData *td)
+ {
++    uint64_t *freq = td->freq;
+     uint64_t c, n[59] = { 0 };
++    uint32_t start = 0;
+     int i;
+ 
+     for (i = 0; i < HUF_ENCSIZE; i++)
+@@ -311,6 +318,14 @@ static void huf_canonical_code_table(uint64_t *freq)
+     c = 0;
+     for (i = 58; i > 0; --i) {
+         uint64_t nc = ((c + n[i]) >> 1);
++        if (i > HUF_VLC_MAXLEN && i <= 32) {
++            td->long_first[i] = c;
++            td->long_count[i] = n[i];
++            td->long_start[i] = start;
++            start += n[i];
++        } else if (i == HUF_VLC_MAXLEN) {
++            td->long_limit = c;
++        }
+         n[i] = c;
+         c    = nc;
+     }
+@@ -329,8 +344,9 @@ static void huf_canonical_code_table(uint64_t *freq)
+ #define LONGEST_LONG_RUN    (255 + SHORTEST_LONG_RUN)
+ 
+ static int huf_unpack_enc_table(GetByteContext *gb,
+-                                int32_t im, int32_t iM, uint64_t *freq)
++                                int32_t im, int32_t iM, EXRThreadData *td)
+ {
++    uint64_t *freq = td->freq;
+     GetBitContext gbit;
+     int ret = init_get_bits8(&gbit, gb->buffer, bytestream2_get_bytes_left(gb));
+     if (ret < 0)
+@@ -366,11 +382,21 @@ static int huf_unpack_enc_table(GetByteContext *gb,
+     }
+ 
+     bytestream2_skip(gb, (get_bits_count(&gbit) + 7) / 8);
+-    huf_canonical_code_table(freq);
++    huf_canonical_code_table(td);
+ 
+     return 0;
+ }
+ 
++/* Canonical codes are consecutive within a length, in symbol order, so a long
++ * code needs only its length's first code and position, however many share it. */
++static void huf_add_long(EXRThreadData *td, int i, int sym)
++{
++    int len = td->freq[i] & 63;
++    uint32_t code = td->freq[i] >> 6;
++
++    td->long_sym[td->long_start[len] + code - td->long_first[len]] = sym;
++}
++
+ static int huf_build_dec_table(const EXRContext *s,
+                                EXRThreadData *td, int im, int iM)
+ {
+@@ -385,10 +411,14 @@ static int huf_build_dec_table(const EXRContext *s,
+             avpriv_request_sample(s->avctx, "Too big code length");
+             return AVERROR_PATCHWELCOME;
+         }
+-        if (td->he[j].len > 0)
++        if (td->he[j].len == 0) {
++            td->run_sym = i;
++        } else if (td->he[j].len <= HUF_VLC_MAXLEN) {
+             j++;
+-        else
++        } else {
+             td->run_sym = i;
++            huf_add_long(td, i, i);
++        }
+     }
+ 
+     if (im > 0)
+@@ -408,7 +438,10 @@ static int huf_build_dec_table(const EXRContext *s,
+         return AVERROR_PATCHWELCOME;
+     }
+     td->he[j].code = td->freq[iM] >> 6;
+-    j++;
++    if (td->he[j].len <= HUF_VLC_MAXLEN)
++        j++;
++    else
++        huf_add_long(td, iM, HUF_RUN);
+ 
+     ff_vlc_free(&td->vlc);
+     return ff_vlc_init_sparse(&td->vlc, 12, j,
+@@ -417,17 +450,40 @@ static int huf_build_dec_table(const EXRContext *s,
+                               &td->he[0].sym, sizeof(td->he[0]), sizeof(td->he[0].sym), 0);
+ }
+ 
+-static int huf_decode(VLC *vlc, GetByteContext *gb, int nbits, int run_sym,
++static int huf_get_long(const EXRThreadData *td, GetBitContext *gb)
++{
++    uint32_t code = get_bits(gb, HUF_VLC_MAXLEN);
++
++    for (int l = HUF_VLC_MAXLEN + 1; l <= 32; l++) {
++        code = code << 1 | get_bits1(gb);
++        if (code - td->long_first[l] < td->long_count[l])
++            return td->long_sym[td->long_start[l] + code - td->long_first[l]];
++    }
++    return AVERROR_INVALIDDATA;
++}
++
++static int huf_decode(const EXRThreadData *td, GetByteContext *gb, int nbits, int run_sym,
+                       int no, uint16_t *out)
+ {
++    const uint32_t long_limit = td->long_limit;
+     GetBitContext gbit;
+     int oe = 0;
+ 
+     init_get_bits(&gbit, gb->buffer, nbits);
+     while (get_bits_left(&gbit) > 0 && oe < no) {
+-        uint16_t x = get_vlc2(&gbit, vlc->table, 12, 3);
++        int x;
++
++        if (long_limit && show_bits(&gbit, HUF_VLC_MAXLEN) < long_limit) {
++            x = huf_get_long(td, &gbit);
++            if (x < 0)
++                return x;
++        } else {
++            x = (uint16_t)get_vlc2(&gbit, td->vlc.table, 12, 2);
++            if (x == run_sym)
++                x = HUF_RUN;
++        }
+ 
+-        if (x == run_sym) {
++        if (x == HUF_RUN) {
+             int run = get_bits(&gbit, 8);
+             uint16_t fill;
+ 
+@@ -469,13 +525,15 @@ static int huf_uncompress(const EXRContext *s,
+         td->freq = av_malloc_array(HUF_ENCSIZE, sizeof(*td->freq));
+     if (!td->he)
+         td->he = av_calloc(HUF_ENCSIZE, sizeof(*td->he));
+-    if (!td->freq || !td->he) {
++    if (!td->long_sym)
++        td->long_sym = av_malloc_array(HUF_ENCSIZE, sizeof(*td->long_sym));
++    if (!td->freq || !td->he || !td->long_sym) {
+         ret = AVERROR(ENOMEM);
+         return ret;
+     }
+ 
+     memset(td->freq, 0, sizeof(*td->freq) * HUF_ENCSIZE);
+-    if ((ret = huf_unpack_enc_table(gb, im, iM, td->freq)) < 0)
++    if ((ret = huf_unpack_enc_table(gb, im, iM, td)) < 0)
+         return ret;
+ 
+     if (nBits > 8 * bytestream2_get_bytes_left(gb)) {
+@@ -485,7 +543,7 @@ static int huf_uncompress(const EXRContext *s,
+ 
+     if ((ret = huf_build_dec_table(s, td, im, iM)) < 0)
+         return ret;
+-    return huf_decode(&td->vlc, gb, nBits, td->run_sym, dst_size, dst);
++    return huf_decode(td, gb, nBits, td->run_sym, dst_size, dst);
+ }
+ 
+ static inline void wdec14(uint16_t l, uint16_t h, uint16_t *a, uint16_t *b)
+@@ -2332,6 +2390,7 @@ static av_cold int decode_end(AVCodecContext *avctx)
+         av_freep(&td->bitmap);
+         av_freep(&td->lut);
+         av_freep(&td->he);
++        av_freep(&td->long_sym);
+         av_freep(&td->freq);
+         av_freep(&td->ac_data);
+         av_freep(&td->dc_data);
