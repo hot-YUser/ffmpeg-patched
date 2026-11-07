@@ -5,7 +5,7 @@
 # A deliberately small, fully deterministic build: no external libraries, so
 # the result depends only on the upstream commit and the patches.  ccache makes
 # the second build of the same tree (the one with the patches applied) cost
-# little more than recompiling the two touched files and relinking.
+# little more than recompiling the touched file and relinking.
 #
 # zlib is enabled explicitly because --disable-autodetect would otherwise drop
 # it, and most of the existing fate-exr tests decode ZIP compressed files.

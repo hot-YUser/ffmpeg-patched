@@ -103,7 +103,7 @@ jobs:
           # configure reports the pkg-config module name, which is not always the
           # flag name, so map them.  Only these may be dropped: RIST and SRT are
           # network transports and rav1e is a third AV1 encoder; none of them
-          # affect FFV1 or EXR, which is what this build exists for.
+          # affect EXR, which is what this build exists for.
           TOLERATE="librist:--enable-librist srt:--enable-libsrt rav1e:--enable-librav1e"
 
           # LAME 4.0's static libmp3lame needs libmpg123, but its lame.pc does not
@@ -224,6 +224,6 @@ jobs:
         run: |
           gh release create "build-${UPSTREAM_SHORT}" "${PKG}.zip" \
             --title "ffmpeg-patched @ ${UPSTREAM_SHORT}" \
-            --notes "Static Windows build of upstream FFmpeg \`${UPSTREAM_SHA}\` with the FFV1 float and OpenEXR PIZ patches applied.
+            --notes "Static Windows build of upstream FFmpeg \`${UPSTREAM_SHA}\` with the OpenEXR PIZ patch applied.
 
           Verified with \`tests/verify.sh\` before packaging. Complete corresponding source: the upstream commit above plus \`patches/\` inside the zip."

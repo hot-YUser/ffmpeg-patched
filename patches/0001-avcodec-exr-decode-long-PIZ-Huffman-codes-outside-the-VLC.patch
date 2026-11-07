@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: JUI YU LIN <hlpmrlinyu@gmail.com>
 Date: Tue, 3 Nov 2026 10:00:00 +0800
-Subject: [PATCH 3/4] avcodec/exr: decode long PIZ Huffman codes outside the VLC
+Subject: [PATCH 1/2] avcodec/exr: decode long PIZ Huffman codes outside the VLC
 
 VLC subtable indices are stored in VLCBaseType, which is int16_t, so a dense
 Huffman table needing a subtable index above 32767 makes build_table() fail

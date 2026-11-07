@@ -59,8 +59,8 @@ jobs:
 
       # ------------------------------------------------------------------
       # 1. Pristine upstream.  Expected to FAIL verification -- that failure
-      #    is what says the bugs are still there.  If it ever passes, upstream
-      #    has fixed them and this repo has done its job.
+      #    is what says the bug is still there.  If it ever passes, upstream
+      #    has fixed it and this repo has done its job.
       # ------------------------------------------------------------------
       - name: Build pristine upstream
         id: build_pristine
@@ -77,7 +77,7 @@ jobs:
 
       # ------------------------------------------------------------------
       # 2. Apply the patches and rebuild.  ccache makes this second build
-      #    cost little more than two recompiles and a relink.
+      #    cost little more than one recompile and a relink.
       # ------------------------------------------------------------------
       - name: Apply patches
         id: apply
@@ -108,9 +108,9 @@ jobs:
           fi
 
       # ------------------------------------------------------------------
-      # 3. FATE, as a regression net around the two touched decoders.
+      # 3. FATE, as a regression net around the touched decoder.
       # ------------------------------------------------------------------
-      - name: FATE (fate-ffv1, fate-exr)
+      - name: FATE (fate-exr)
         id: fate
         if: steps.patched.outputs.ok == 'true'
         run: |
@@ -121,15 +121,14 @@ jobs:
                 rsync://fate-suite.ffmpeg.org/fate-suite/exr/ "$S/exr/" \
             || echo "::warning::could not refresh fate samples, using cache"
           cp tests/assets/rgb_scanline_float_piz_dense_448x32.exr "$S/exr/"
-          make -C src -j"$(nproc)" fate-ffv1 fate-exr SAMPLES="$S" 2>&1 | tee fate.log
+          make -C src -j"$(nproc)" fate-exr SAMPLES="$S" 2>&1 | tee fate.log
 
           # Without SAMPLES, or with a missing component, a test is silently
           # dropped rather than failed -- a green make would prove nothing.
-          # Assert both new tests actually ran.
-          for t in ffv1-float-golomb exr-rgb-scanline-float-piz-dense; do
-            grep -qE "^TEST[[:space:]]+$t\$" fate.log \
-              || { echo "::error::fate test $t did not run"; exit 1; }
-          done
+          # Assert the new test actually ran.
+          t=exr-rgb-scanline-float-piz-dense
+          grep -qE "^TEST[[:space:]]+$t\$" fate.log \
+            || { echo "::error::fate test $t did not run"; exit 1; }
           echo "fate: $(grep -c '^TEST' fate.log) tests ran"
 
       # ------------------------------------------------------------------
@@ -183,8 +182,8 @@ jobs:
             notify "upstream passes without our patches" \
               "Pristine upstream \`$UPSTREAM_SHA\` passed \`tests/verify.sh\` with no patches" \
               "applied." "" \
-              "Either the bugs were fixed upstream, or a check stopped being a real gate." \
-              "Confirm which, then retire the corresponding patch."
+              "Either the bug was fixed upstream, or a check stopped being a real gate." \
+              "Confirm which, then retire the patches."
             exit 0
           fi
 
@@ -210,7 +209,7 @@ jobs:
               "The patches applied to upstream \`$UPSTREAM_SHA\` with no conflict, the tree" \
               "built, and the resulting binary FAILED \`tests/verify.sh\`." "" \
               "This is the failure mode a conflict check cannot see: upstream has most" \
-              "likely fixed one of these bugs from the other side of the codec, so our" \
+              "likely fixed the same bug another way, so our" \
               "patch is now applying the correction a second time. **Do not ship this build.**"
             exit 1
           fi
@@ -218,7 +217,7 @@ jobs:
           if [ "$FATE" != 'success' ]; then
             say "### FATE regression"
             notify "FATE regression against upstream master" \
-              "\`tests/verify.sh\` passed but \`fate-ffv1\`/\`fate-exr\` did not, against" \
+              "\`tests/verify.sh\` passed but \`fate-exr\` did not, against" \
               "upstream \`$UPSTREAM_SHA\`."
             exit 1
           fi

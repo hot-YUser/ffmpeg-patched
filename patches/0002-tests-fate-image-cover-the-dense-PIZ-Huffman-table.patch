@@ -1,7 +1,7 @@
 From 0a0f0a055b3fd56e50ea871acef9b88e10e3f28e Mon Sep 17 00:00:00 2001
 From: JUI YU LIN <hlpmrlinyu@gmail.com>
 Date: Thu, 6 Aug 2026 13:54:21 +0800
-Subject: [PATCH 4/4] tests/fate/image: cover the dense PIZ Huffman table
+Subject: [PATCH 2/2] tests/fate/image: cover the dense PIZ Huffman table
 
 The sample is 448x32 of float noise written by the OpenEXR reference library
 with PIZ compression, which is enough to need Huffman codes longer than 14 bits
